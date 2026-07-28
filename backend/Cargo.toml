@@ -1,0 +1,17 @@
+[package]
+name = "photos-backend"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kelas Tanpa Tembok"]
+description = "Stuff8 Photos Domain Service — Handles media upload, processing, and S3/MinIO storage integration"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+axum = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+aws-config = "1.5"
+aws-sdk-s3 = "1.38"
+dotenvy = "0.15"
