@@ -48,23 +48,21 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    dotenvy::ok();
+    dotenvy::dotenv().ok();
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let port: u16 = std::env::var("PORT")
+        .or_else(|_| std::env::var("SERVER_PORT"))
         .unwrap_or_else(|_| "8081".to_string())
         .parse()
         .unwrap_or(8081);
 
-    let s3_endpoint = std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
-    let s3_bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "stuff8-photos".to_string());
-
     let state = AppState {
         photos: Arc::new(Mutex::new(HashMap::new())),
-        s3_endpoint,
-        s3_bucket,
+        s3_endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string()),
+        s3_bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "stuff8-photos".to_string()),
     };
 
     let cors = CorsLayer::new()
@@ -95,7 +93,7 @@ async fn health_check() -> &'static str {
 
 async fn request_presigned_url(
     State(state): State<AppState>,
-    Json(payload): Json<PresignedUrlRequest>,
+    Json(_payload): Json<PresignedUrlRequest>,
 ) -> Json<PresignedUrlResponse> {
     let photo_id = Uuid::new_v4().to_string();
     let upload_url = format!("{}/api/photos/upload?id={}", state.s3_endpoint, photo_id);
