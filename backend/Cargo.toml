@@ -8,7 +8,7 @@ description = "Stuff8 Photos Domain Service — Handles media upload, processing
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["multipart"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "limit"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
@@ -19,3 +19,5 @@ aws-credential-types = "1.2"
 dotenvy = "0.15"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+image = "0.25"
+webp = "0.3"

@@ -1,49 +1,58 @@
+use aws_config::BehaviorVersion;
+use aws_credential_types::Credentials;
+use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
 use axum::{
-    extract::{Multipart, Path, State},
-    http::{HeaderValue, StatusCode},
+    extract::{Multipart, Path, Query, State},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
+use std::{collections::HashMap, net::SocketAddr};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    limit::RequestBodyLimitLayer,
 };
-use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use webp::Encoder;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhotoMetadata {
-    pub id: String,
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+const MAX_IMAGE_PIXELS: u32 = 40_000_000;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredObject {
+    pub key: String,
     pub original_name: String,
     pub mime_type: String,
     pub size_bytes: u64,
-    pub public_url: String,
+    pub kind: String,
+    pub owner_id: String,
+    pub namespace: String,
+    pub reference_id: String,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PresignedUrlRequest {
-    pub filename: String,
-    pub mime_type: String,
+pub struct ListObjectsQuery {
+    pub owner_id: String,
+    pub namespace: String,
+    pub reference_id: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct PresignedUrlResponse {
-    pub photo_id: String,
-    pub upload_url: String,
-    pub public_url: String,
+#[derive(Debug, Deserialize)]
+pub struct DeleteObjectQuery {
+    pub owner_id: String,
 }
 
 #[derive(Clone)]
 pub struct AppState {
-    pub photos: Arc<Mutex<HashMap<String, (PhotoMetadata, Vec<u8>)>>>,
-    pub s3_endpoint: String,
-    pub s3_bucket: String,
+    client: Client,
+    bucket: String,
 }
 
 #[tokio::main]
@@ -53,132 +62,513 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let port: u16 = std::env::var("PORT")
-        .or_else(|_| std::env::var("SERVER_PORT"))
-        .unwrap_or_else(|_| "8081".to_string())
-        .parse()
-        .unwrap_or(8081);
-
+    let port = env("PORT", "8081").parse().unwrap_or(8081);
+    let endpoint = required_env("S3_ENDPOINT");
+    let bucket = env("S3_BUCKET", "eco-storage");
+    let region = env("S3_REGION", "us-east-1");
+    let credentials = Credentials::new(
+        required_env("S3_ACCESS_KEY"),
+        required_env("S3_SECRET_KEY"),
+        None,
+        None,
+        "eco-managed-minio",
+    );
+    let shared = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(region))
+        .credentials_provider(credentials)
+        .endpoint_url(endpoint)
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&shared)
+        .force_path_style(true)
+        .build();
     let state = AppState {
-        photos: Arc::new(Mutex::new(HashMap::new())),
-        s3_endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string()),
-        s3_bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "stuff8-photos".to_string()),
+        client: Client::from_conf(s3_config),
+        bucket,
     };
-
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    ensure_bucket(&state)
+        .await
+        .expect("Unable to initialise the configured S3 bucket");
 
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/api/photos/health", get(health_check))
-        .route("/api/photos/upload-url", post(request_presigned_url))
-        .route("/api/photos/upload", post(upload_photo_file))
-        .route("/api/photos/:id", get(get_photo_info))
-        .route("/api/photos/:id/file", get(serve_photo_file))
-        .layer(cors)
+        // Generic, reusable storage API. `/api/photos` remains only the
+        // Stuff8 service identity; consumers should use `/api/storage`.
+        .route(
+            "/api/storage/objects",
+            post(upload_object).get(list_objects),
+        )
+        .route("/api/storage/content/*key", get(download_object))
+        .route(
+            "/api/storage/objects/*key",
+            get(object_metadata).delete(delete_object),
+        )
+        .layer(RequestBodyLimitLayer::new(MAX_DOCUMENT_BYTES))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("Photos domain service listening on {}", addr);
-
+    tracing::info!(%addr, "Storage domain service listening");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health_check() -> &'static str {
-    "OK - Photos domain service (S3 & Presigned Upload ready)"
+fn env(name: &str, fallback: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| fallback.to_string())
 }
 
-async fn request_presigned_url(
-    State(state): State<AppState>,
-    Json(_payload): Json<PresignedUrlRequest>,
-) -> Json<PresignedUrlResponse> {
-    let photo_id = Uuid::new_v4().to_string();
-    let upload_url = format!("{}/api/photos/upload?id={}", state.s3_endpoint, photo_id);
-    let public_url = format!("/api/photos/{}/file", photo_id);
+fn required_env(name: &str) -> String {
+    std::env::var(name)
+        .unwrap_or_else(|_| panic!("{name} must be configured for the storage domain"))
+}
 
-    Json(PresignedUrlResponse {
-        photo_id,
-        upload_url,
-        public_url,
+async fn ensure_bucket(state: &AppState) -> Result<(), aws_sdk_s3::Error> {
+    if state
+        .client
+        .head_bucket()
+        .bucket(&state.bucket)
+        .send()
+        .await
+        .is_err()
+    {
+        state
+            .client
+            .create_bucket()
+            .bucket(&state.bucket)
+            .send()
+            .await?;
+    }
+    Ok(())
+}
+
+async fn health_check() -> &'static str {
+    "OK - Storage domain service (S3/MinIO)"
+}
+
+async fn upload_object(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<StoredObject>), (StatusCode, String)> {
+    let mut fields = HashMap::new();
+    let mut filename = None;
+    let mut content_type = None;
+    let mut bytes = None;
+
+    while let Some(field) = multipart.next_field().await.map_err(bad_request)? {
+        let name = field.name().unwrap_or_default().to_owned();
+        if name == "file" {
+            filename = field.file_name().map(ToOwned::to_owned);
+            content_type = field.content_type().map(ToOwned::to_owned);
+            bytes = Some(field.bytes().await.map_err(bad_request)?.to_vec());
+        } else {
+            fields.insert(name, field.text().await.map_err(bad_request)?);
+        }
+    }
+
+    let owner_id = safe_segment(required_field(&fields, "owner_id")?)?;
+    let namespace = safe_segment(required_field(&fields, "namespace")?)?;
+    let reference_id = safe_segment(required_field(&fields, "reference_id")?)?;
+    let original_name = filename.unwrap_or_else(|| "upload".to_string());
+    let input = bytes.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Field file wajib diisi".to_string(),
+        )
+    })?;
+    let declared_type = content_type.unwrap_or_else(|| mime_from_name(&original_name));
+    let processed = process_upload(&input, &declared_type, &original_name)?;
+    let key = format!(
+        "{namespace}/{reference_id}/{}.{}",
+        Uuid::new_v4(),
+        processed.extension
+    );
+    let now = Utc::now();
+
+    state
+        .client
+        .put_object()
+        .bucket(&state.bucket)
+        .key(&key)
+        .body(ByteStream::from(processed.bytes))
+        .content_type(&processed.mime_type)
+        .metadata("owner-id", &owner_id)
+        .metadata("namespace", &namespace)
+        .metadata("reference-id", &reference_id)
+        .metadata("original-name", &original_name)
+        .metadata("kind", processed.kind)
+        .metadata("created-at", now.to_rfc3339())
+        .send()
+        .await
+        .map_err(s3_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(StoredObject {
+            key,
+            original_name,
+            mime_type: processed.mime_type,
+            size_bytes: processed.size_bytes as u64,
+            kind: processed.kind.to_string(),
+            owner_id,
+            namespace,
+            reference_id,
+            created_at: now,
+        }),
+    ))
+}
+
+async fn list_objects(
+    State(state): State<AppState>,
+    Query(query): Query<ListObjectsQuery>,
+) -> Result<Json<Vec<StoredObject>>, (StatusCode, String)> {
+    let owner_id = safe_segment(&query.owner_id)?;
+    let namespace = safe_segment(&query.namespace)?;
+    let reference_id = safe_segment(&query.reference_id)?;
+    let prefix = format!("{namespace}/{reference_id}/");
+    let listed = state
+        .client
+        .list_objects_v2()
+        .bucket(&state.bucket)
+        .prefix(prefix)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    let mut objects = Vec::new();
+    for object in listed.contents() {
+        let Some(key) = object.key() else {
+            continue;
+        };
+        let head = state
+            .client
+            .head_object()
+            .bucket(&state.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(s3_error)?;
+        let metadata = head.metadata().cloned().unwrap_or_default();
+        if metadata
+            .get("owner-id")
+            .is_some_and(|value| value == &owner_id)
+        {
+            objects.push(stored_object_from_head(
+                key.to_string(),
+                &metadata,
+                head.content_type(),
+                head.content_length().unwrap_or(0),
+            ));
+        }
+    }
+    objects.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(Json(objects))
+}
+
+async fn object_metadata(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<StoredObject>, (StatusCode, String)> {
+    let key = valid_key(&key)?;
+    let head = state
+        .client
+        .head_object()
+        .bucket(&state.bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    Ok(Json(stored_object_from_head(
+        key,
+        &head.metadata().cloned().unwrap_or_default(),
+        head.content_type(),
+        head.content_length().unwrap_or(0),
+    )))
+}
+
+async fn download_object(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let key = valid_key(&key)?;
+    let object = state
+        .client
+        .get_object()
+        .bucket(&state.bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    let mime_type = object
+        .content_type()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = object.body.collect().await.map_err(s3_error)?.into_bytes();
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&mime_type)
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    Ok(response)
+}
+
+async fn delete_object(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Query(query): Query<DeleteObjectQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let key = valid_key(&key)?;
+    let head = state
+        .client
+        .head_object()
+        .bucket(&state.bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    if head
+        .metadata()
+        .and_then(|meta| meta.get("owner-id"))
+        .is_none_or(|owner| owner != &query.owner_id)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Hanya pemilik file yang dapat menghapusnya".to_string(),
+        ));
+    }
+    state
+        .client
+        .delete_object()
+        .bucket(&state.bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+struct ProcessedUpload {
+    bytes: Vec<u8>,
+    mime_type: String,
+    extension: &'static str,
+    kind: &'static str,
+    size_bytes: usize,
+}
+
+fn process_upload(
+    bytes: &[u8],
+    mime_type: &str,
+    filename: &str,
+) -> Result<ProcessedUpload, (StatusCode, String)> {
+    if is_image(mime_type) {
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Ukuran gambar maksimal 20 MB".to_string(),
+            ));
+        }
+        let image = image::load_from_memory(bytes).map_err(|_| {
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "File gambar tidak valid".to_string(),
+            )
+        })?;
+        let (width, height) = image.dimensions();
+        if width.saturating_mul(height) > MAX_IMAGE_PIXELS {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Resolusi gambar terlalu besar".to_string(),
+            ));
+        }
+        let candidate = if image.color().has_alpha() {
+            Encoder::from_rgba(image.to_rgba8().as_raw(), width, height)
+                .encode(80.0)
+                .to_vec()
+        } else {
+            Encoder::from_rgb(image.to_rgb8().as_raw(), width, height)
+                .encode(80.0)
+                .to_vec()
+        };
+        if candidate.len() < bytes.len() {
+            return Ok(ProcessedUpload {
+                size_bytes: candidate.len(),
+                bytes: candidate,
+                mime_type: "image/webp".to_string(),
+                extension: "webp",
+                kind: "image",
+            });
+        }
+        return Ok(ProcessedUpload {
+            size_bytes: bytes.len(),
+            bytes: bytes.to_vec(),
+            mime_type: mime_type.to_string(),
+            extension: extension_for(filename, mime_type),
+            kind: "image",
+        });
+    }
+    if !is_document(mime_type) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Jenis file tidak didukung".to_string(),
+        ));
+    }
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Ukuran dokumen maksimal 50 MB".to_string(),
+        ));
+    }
+    Ok(ProcessedUpload {
+        size_bytes: bytes.len(),
+        bytes: bytes.to_vec(),
+        mime_type: mime_type.to_string(),
+        extension: extension_for(filename, mime_type),
+        kind: "document",
     })
 }
 
-async fn upload_photo_file(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> Result<Json<PhotoMetadata>, (StatusCode, String)> {
-    let mut photo_id = Uuid::new_v4().to_string();
-    let mut original_name = "image.jpg".to_string();
-    let mut mime_type = "image/jpeg".to_string();
-    let mut file_data = Vec::new();
-
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or_default().to_string();
-        if name == "photo_id" || name == "id" {
-            if let Ok(text) = field.text().await {
-                if !text.is_empty() {
-                    photo_id = text;
-                }
-            }
-        } else if name == "file" || field.file_name().is_some() {
-            if let Some(fname) = field.file_name() {
-                original_name = fname.to_string();
-            }
-            if let Some(ct) = field.content_type() {
-                mime_type = ct.to_string();
-            }
-            if let Ok(bytes) = field.bytes().await {
-                file_data = bytes.to_vec();
-            }
-        }
-    }
-
-    if file_data.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No file data provided".to_string()));
-    }
-
-    let meta = PhotoMetadata {
-        id: photo_id.clone(),
-        original_name,
-        mime_type,
-        size_bytes: file_data.len() as u64,
-        public_url: format!("/api/photos/{}/file", photo_id),
-        created_at: Utc::now(),
-    };
-
-    let mut map = state.photos.lock().unwrap();
-    map.insert(photo_id, (meta.clone(), file_data));
-
-    Ok(Json(meta))
+fn is_image(mime: &str) -> bool {
+    matches!(mime, "image/jpeg" | "image/png" | "image/webp")
 }
-
-async fn get_photo_info(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<PhotoMetadata>, (StatusCode, String)> {
-    let map = state.photos.lock().unwrap();
-    if let Some((meta, _)) = map.get(&id) {
-        Ok(Json(meta.clone()))
-    } else {
-        Err((StatusCode::NOT_FOUND, "Photo not found".to_string()))
+fn is_document(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/pdf"
+            | "application/msword"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.ms-excel"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "text/plain"
+    )
+}
+fn extension_for(filename: &str, mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "text/plain" => "txt",
+        _ if filename.ends_with(".bin") => "bin",
+        _ => "bin",
     }
 }
-
-async fn serve_photo_file(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> Response {
-    let map = state.photos.lock().unwrap();
-    if let Some((meta, bytes)) = map.get(&id) {
-        let mut response = (StatusCode::OK, bytes.clone()).into_response();
-        if let Ok(hv) = HeaderValue::from_str(&meta.mime_type) {
-            response.headers_mut().insert(axum::http::header::CONTENT_TYPE, hv);
-        }
-        response
+fn mime_from_name(name: &str) -> String {
+    if name.ends_with(".png") {
+        "image/png"
+    } else if name.ends_with(".webp") {
+        "image/webp"
+    } else if name.ends_with(".pdf") {
+        "application/pdf"
     } else {
-        (StatusCode::NOT_FOUND, "Photo file not found").into_response()
+        "image/jpeg"
+    }
+    .to_string()
+}
+fn required_field<'a>(
+    fields: &'a HashMap<String, String>,
+    name: &str,
+) -> Result<&'a str, (StatusCode, String)> {
+    fields
+        .get(name)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Field {name} wajib diisi")))
+}
+fn safe_segment(value: &str) -> Result<String, (StatusCode, String)> {
+    if !value.is_empty()
+        && value.len() <= 120
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Identifier storage tidak valid".to_string(),
+        ))
+    }
+}
+fn valid_key(key: &str) -> Result<String, (StatusCode, String)> {
+    if key.split('/').all(|segment| safe_segment(segment).is_ok()) {
+        Ok(key.to_string())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Key storage tidak valid".to_string(),
+        ))
+    }
+}
+fn stored_object_from_head(
+    key: String,
+    metadata: &HashMap<String, String>,
+    content_type: Option<&str>,
+    content_length: i64,
+) -> StoredObject {
+    StoredObject {
+        key,
+        original_name: metadata
+            .get("original-name")
+            .cloned()
+            .unwrap_or_else(|| "file".to_string()),
+        mime_type: content_type
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        size_bytes: content_length.max(0) as u64,
+        kind: metadata
+            .get("kind")
+            .cloned()
+            .unwrap_or_else(|| "document".to_string()),
+        owner_id: metadata.get("owner-id").cloned().unwrap_or_default(),
+        namespace: metadata.get("namespace").cloned().unwrap_or_default(),
+        reference_id: metadata.get("reference-id").cloned().unwrap_or_default(),
+        created_at: metadata
+            .get("created-at")
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now),
+    }
+}
+fn bad_request<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("Upload tidak valid: {error}"),
+    )
+}
+fn s3_error<E: std::fmt::Display>(error: E) -> (StatusCode, String) {
+    tracing::error!(%error, "S3 operation failed");
+    (
+        StatusCode::BAD_GATEWAY,
+        "Storage tidak tersedia".to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{codecs::jpeg::JpegEncoder, ImageBuffer, Rgb};
+
+    #[test]
+    fn image_conversion_never_increases_the_stored_file_size() {
+        let image = ImageBuffer::from_pixel(320, 240, Rgb([32u8, 83, 158]));
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&image)
+            .unwrap();
+
+        let stored = process_upload(&jpeg, "image/jpeg", "inventory.jpg").unwrap();
+        assert!(stored.size_bytes <= jpeg.len());
+        if stored.mime_type == "image/webp" {
+            assert!(stored.size_bytes < jpeg.len());
+        }
     }
 }
