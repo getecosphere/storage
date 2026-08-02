@@ -307,12 +307,21 @@ async fn download_object(
         .content_type()
         .unwrap_or("application/octet-stream")
         .to_string();
+    let original_name = object
+        .metadata()
+        .and_then(|metadata| metadata.get("original-name"))
+        .cloned()
+        .unwrap_or_else(|| key.rsplit('/').next().unwrap_or("download").to_string());
     let bytes = object.body.collect().await.map_err(s3_error)?.into_bytes();
     let mut response = (StatusCode::OK, bytes).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&mime_type)
             .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        download_disposition(&original_name),
     );
     Ok(response)
 }
@@ -446,6 +455,24 @@ fn is_document(mime: &str) -> bool {
             | "text/plain"
     )
 }
+
+/// Keep the S3 key opaque while giving the browser the original upload name.
+/// RFC 5987's `filename*` keeps Unicode names valid in a response header.
+fn download_disposition(filename: &str) -> HeaderValue {
+    let encoded = filename
+        .as_bytes()
+        .iter()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                format!("{}", *byte as char)
+            }
+            _ => format!("%{:02X}", byte),
+        })
+        .collect::<String>();
+    HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}"))
+        .unwrap_or(HeaderValue::from_static("attachment"))
+}
+
 fn extension_for(filename: &str, mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => "jpg",
