@@ -329,7 +329,7 @@ async fn download_object(
     );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        download_disposition(&original_name),
+        download_disposition(&original_name, &mime_type),
     );
     Ok(response)
 }
@@ -466,7 +466,10 @@ fn is_document(mime: &str) -> bool {
 
 /// Keep the S3 key opaque while giving the browser the original upload name.
 /// RFC 5987's `filename*` keeps Unicode names valid in a response header.
-fn download_disposition(filename: &str) -> HeaderValue {
+/// Images are served `inline` so browsers and email clients render them in
+/// place (Gmail/Outlook refuse to display `attachment` images); non-image
+/// documents keep `attachment` so they still download instead of rendering.
+fn download_disposition(filename: &str, mime: &str) -> HeaderValue {
     let encoded = filename
         .as_bytes()
         .iter()
@@ -477,8 +480,9 @@ fn download_disposition(filename: &str) -> HeaderValue {
             _ => format!("%{:02X}", byte),
         })
         .collect::<String>();
-    HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{encoded}"))
-        .unwrap_or(HeaderValue::from_static("attachment"))
+    let kind = if is_image(mime) { "inline" } else { "attachment" };
+    HeaderValue::from_str(&format!("{kind}; filename*=UTF-8''{encoded}"))
+        .unwrap_or_else(|_| HeaderValue::from_str(&kind).unwrap())
 }
 
 fn extension_for(filename: &str, mime: &str) -> &'static str {
