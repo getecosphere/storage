@@ -2,7 +2,7 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -105,6 +105,11 @@ async fn main() {
             get(object_metadata).delete(delete_object),
         )
         .layer(RequestBodyLimitLayer::new(MAX_DOCUMENT_BYTES))
+        // axum's Multipart extractor reads DefaultBodyLimit (via
+        // with_limited_body) and defaults to 2MB; the tower_http
+        // RequestBodyLimitLayer above does not raise it. Without this, any
+        // upload over ~2MB fails multipart parsing with a 400.
+        .layer(DefaultBodyLimit::max(MAX_DOCUMENT_BYTES))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
