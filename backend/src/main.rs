@@ -20,7 +20,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use webp::Encoder;
 
-const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u32 = 40_000_000;
 
@@ -108,8 +108,11 @@ async fn main() {
         // axum's Multipart extractor reads DefaultBodyLimit (via
         // with_limited_body) and defaults to 2MB; the tower_http
         // RequestBodyLimitLayer above does not raise it. Without this, any
-        // upload over ~2MB fails multipart parsing with a 400.
-        .layer(DefaultBodyLimit::max(MAX_DOCUMENT_BYTES))
+        // upload over ~2MB fails multipart parsing with a 400. Set it just
+        // above the image cap so an oversize image is parsed and then
+        // rejected by process_upload's clear "Ukuran gambar maksimal 5 MB"
+        // message instead of the generic multipart parse error.
+        .layer(DefaultBodyLimit::max(MAX_IMAGE_BYTES + 1024 * 1024))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -383,7 +386,7 @@ fn process_upload(
         if bytes.len() > MAX_IMAGE_BYTES {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Ukuran gambar maksimal 20 MB".to_string(),
+                "Ukuran gambar maksimal 5 MB".to_string(),
             ));
         }
         let image = image::load_from_memory(bytes).map_err(|_| {
