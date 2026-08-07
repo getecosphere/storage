@@ -116,14 +116,42 @@ estate gateway as `/api/...` or the `photos.stuff8.com` hostname
 (`expose.additional` in `ecompose.yml`).
 
 - `POST /api/storage/objects` — multipart `file`, `owner_id`, `namespace`,
-  `reference_id` → stores and returns object metadata. Images → WebP when
-  smaller; documents stored as-is; videos → ffmpeg MP4 (`kind: "video"`)
+  `reference_id` → stores and returns object metadata. Images → downscaled to
+  `IMAGE_MAX_DIMENSION` (default 1600) WebP when smaller, plus an auto-generated
+  `-thumb.webp` sibling (`thumbnail_key` in the response, sized by
+  `THUMBNAIL_DIMENSION`, default 400); documents stored as-is; videos → ffmpeg
+  MP4 (`kind: "video"`)
 - `GET /api/storage/objects?owner_id=&namespace=&reference_id=` — list owned
   objects
 - `GET /api/storage/content/*key` — retrieve content (Range streaming; images
-  and videos served inline so browsers render/play them in place)
+  and videos served inline so browsers render/play them in place). List/grid
+  views should load the `thumbnail_key` URL instead of the full image.
 - `GET /api/storage/objects/*key` — object metadata
-- `DELETE /api/storage/objects/*key?owner_id=` — remove an owned object
+- `DELETE /api/storage/objects/*key?owner_id=` — remove an owned object (also
+  removes its `-thumb.webp` sibling)
 
 `owner_id`, `namespace`, `reference_id`, and path segments are validated as
 `[A-Za-z0-9._-]` (`safe_segment`); S3 keys stay opaque to consumers.
+
+## Thumbnails (2026-08-07)
+
+Every image upload now produces two objects: the full WebP (downscaled to at
+most `IMAGE_MAX_DIMENSION` px on the long edge, so a 12MP phone photo is no
+longer a multi-MB download) and a small WebP thumbnail at `<uuid>-thumb.webp`
+(`THUMBNAIL_DIMENSION` px). `POST /api/storage/objects` returns the thumbnail
+key as `thumbnail_key`; the frontend serves it from list/grid views (`/inventory`,
+`/marketplace`) and the full image from detail pages, lightboxes and OG images.
+
+Pre-existing images uploaded before this change have **no** thumbnail object —
+a `-thumb.webp` request 404s. The consuming frontend must fall back to the full
+image (onerror swap to `.../storage/content/{key}`) so old inventory items keep
+rendering.
+
+## ffmpeg hang protection (2026-08-07)
+
+`run_ffmpeg` now enforces a 120s timeout and kills the child on timeout, so a
+stalled/corrupt video returns a clear `408 Request Timeout` instead of holding
+the upload request (and the Cloudflare tunnel) open forever. `transcode_video`
+also removes its temp output on failure. The *input* temp file is removed in
+`upload_object` as before — but only after transcode returns; a timeout now
+returns before that, so orphaned `eco-video-in-*` files are gone too.

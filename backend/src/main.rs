@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use image::GenericImageView;
+use image::{imageops::FilterType, GenericImageView};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr};
 use tokio::io::AsyncWriteExt;
@@ -30,6 +30,11 @@ pub struct UploadLimits {
     pub max_document_bytes: usize,
     pub max_image_pixels: u32,
     pub max_video_bytes: usize,
+    /// Long-edge limit the main image is downscaled to (WebP re-encode), so a
+    /// 12MP phone photo never stays a multi-megabyte download.
+    pub image_max_dimension: u32,
+    /// Long edge of the auto-generated WebP thumbnail served by list/grid views.
+    pub thumbnail_dimension: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +48,10 @@ pub struct StoredObject {
     pub namespace: String,
     pub reference_id: String,
     pub created_at: DateTime<Utc>,
+    /// For images, the key of the auto-generated WebP thumbnail (grid/list
+    /// views serve this instead of the full image). `None` for videos,
+    /// documents, or pre-thumbnail objects.
+    pub thumbnail_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +89,8 @@ async fn main() {
         max_document_bytes: (env_u64("MAX_DOCUMENT_MB", 50) * 1024 * 1024) as usize,
         max_image_pixels: env_u64("MAX_IMAGE_PIXELS", 40_000_000) as u32,
         max_video_bytes: (env_u64("MAX_VIDEO_MB", 200) * 1024 * 1024) as usize,
+        image_max_dimension: env_u64("IMAGE_MAX_DIMENSION", 1600) as u32,
+        thumbnail_dimension: env_u64("THUMBNAIL_DIMENSION", 400) as u32,
     };
     let credentials = Credentials::new(
         required_env("S3_ACCESS_KEY"),
@@ -251,7 +262,7 @@ async fn upload_object(
         ));
     }
 
-    let (put_body, mime_type, extension, kind, size_bytes, output_to_clean) =
+    let (put_body, mime_type, extension, kind, size_bytes, output_to_clean, thumbnail_bytes) =
         if let Some(input_path) = video_input {
             let transcoded = transcode_video(state.limits, &input_path, &original_name).await?;
             // The input is fully consumed by ffmpeg, so it can go now. The
@@ -269,6 +280,7 @@ async fn upload_object(
                 transcoded.kind,
                 transcoded.size_bytes,
                 Some(transcoded.path),
+                None,
             )
         } else {
             let processed = process_upload(
@@ -284,31 +296,56 @@ async fn upload_object(
                 processed.kind,
                 processed.size_bytes as u64,
                 None,
+                processed.thumbnail,
             )
         };
+    let object_id = Uuid::new_v4();
     let key = format!(
         "{namespace}/{reference_id}/{}.{}",
-        Uuid::new_v4(),
-        extension
+        object_id, extension
     );
     let now = Utc::now();
 
-    state
-        .client
-        .put_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .body(put_body)
-        .content_type(&mime_type)
-        .metadata("owner-id", &owner_id)
-        .metadata("namespace", &namespace)
-        .metadata("reference-id", &reference_id)
-        .metadata("original-name", &original_name)
-        .metadata("kind", kind)
-        .metadata("created-at", now.to_rfc3339())
-        .send()
-        .await
-        .map_err(s3_error)?;
+    let put_metadata = |builder: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder| {
+        builder
+            .metadata("owner-id", &owner_id)
+            .metadata("namespace", &namespace)
+            .metadata("reference-id", &reference_id)
+            .metadata("original-name", &original_name)
+            .metadata("kind", kind)
+            .metadata("created-at", now.to_rfc3339())
+    };
+
+    let request = put_metadata(
+        state
+            .client
+            .put_object()
+            .bucket(&state.bucket)
+            .key(&key)
+            .body(put_body)
+            .content_type(&mime_type),
+    );
+    request.send().await.map_err(s3_error)?;
+
+    // Thumbnail for images: a small WebP sibling the list/grid views can load
+    // instead of the full image. Stored under `<uuid>-thumb.webp`.
+    let thumbnail_key = thumbnail_bytes.as_ref().map(|_| {
+        format!(
+            "{namespace}/{reference_id}/{object_id}-thumb.webp"
+        )
+    });
+    if let (Some(thumb), Some(thumb_key)) = (thumbnail_bytes.as_ref(), thumbnail_key.as_ref()) {
+        let thumb_request = put_metadata(
+            state
+                .client
+                .put_object()
+                .bucket(&state.bucket)
+                .key(thumb_key)
+                .body(ByteStream::from(thumb.clone()))
+                .content_type("image/webp"),
+        );
+        thumb_request.send().await.map_err(s3_error)?;
+    }
     if let Some(path) = output_to_clean {
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -325,6 +362,7 @@ async fn upload_object(
             namespace,
             reference_id,
             created_at: now,
+            thumbnail_key,
         }),
     ))
 }
@@ -578,14 +616,28 @@ async fn delete_object(
             "Hanya pemilik file yang dapat menghapusnya".to_string(),
         ));
     }
+    let kind = head.metadata().and_then(|meta| meta.get("kind")).map(String::as_str);
     state
         .client
         .delete_object()
         .bucket(&state.bucket)
-        .key(key)
+        .key(&key)
         .send()
         .await
         .map_err(s3_error)?;
+    // Images also carry a `-thumb.webp` sibling; remove it too so clearing an
+    // item doesn't orphan a thumbnail in storage.
+    if kind == Some("image") {
+        let thumb_key = format!("{}-thumb.webp", key.trim_end_matches(".webp"));
+        state
+            .client
+            .delete_object()
+            .bucket(&state.bucket)
+            .key(&thumb_key)
+            .send()
+            .await
+            .map_err(s3_error)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -595,6 +647,35 @@ struct ProcessedUpload {
     extension: &'static str,
     kind: &'static str,
     size_bytes: usize,
+    /// Small WebP variant for images (list/grid views), `None` otherwise.
+    thumbnail: Option<Vec<u8>>,
+}
+
+fn fit_dimensions(width: u32, height: u32, max_dim: u32) -> (u32, u32) {
+    let longest = width.max(height);
+    if longest <= max_dim || longest == 0 {
+        (width, height)
+    } else {
+        let scale = max_dim as f64 / longest as f64;
+        (
+            ((width as f64 * scale).round() as u32).max(1),
+            ((height as f64 * scale).round() as u32).max(1),
+        )
+    }
+}
+
+fn encode_webp(image: &image::DynamicImage, quality: f32) -> Vec<u8> {
+    if image.color().has_alpha() {
+        let rgba = image.to_rgba8();
+        Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+            .encode(quality)
+            .to_vec()
+    } else {
+        let rgb = image.to_rgb8();
+        Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+            .encode(quality)
+            .to_vec()
+    }
 }
 
 fn process_upload(
@@ -626,15 +707,27 @@ fn process_upload(
                 "Resolusi gambar terlalu besar".to_string(),
             ));
         }
-        let candidate = if image.color().has_alpha() {
-            Encoder::from_rgba(image.to_rgba8().as_raw(), width, height)
-                .encode(80.0)
-                .to_vec()
+
+        // Downscale the main image so a phone photo is no longer a multi-MB
+        // download for the detail view, then re-encode to WebP (kept only
+        // when it is actually smaller than the original, as before).
+        let (main_w, main_h) = fit_dimensions(width, height, limits.image_max_dimension);
+        let main_image = if main_w != width || main_h != height {
+            image.resize(main_w, main_h, FilterType::Lanczos3)
         } else {
-            Encoder::from_rgb(image.to_rgb8().as_raw(), width, height)
-                .encode(80.0)
-                .to_vec()
+            image.clone()
         };
+        let candidate = encode_webp(&main_image, 80.0);
+
+        // A small WebP thumbnail for list/grid views.
+        let (thumb_w, thumb_h) = fit_dimensions(width, height, limits.thumbnail_dimension);
+        let thumb_image = if thumb_w != width || thumb_h != height {
+            image.resize(thumb_w, thumb_h, FilterType::Lanczos3)
+        } else {
+            image.clone()
+        };
+        let thumbnail = encode_webp(&thumb_image, 80.0);
+
         if candidate.len() < bytes.len() {
             return Ok(ProcessedUpload {
                 size_bytes: candidate.len(),
@@ -642,6 +735,7 @@ fn process_upload(
                 mime_type: "image/webp".to_string(),
                 extension: "webp",
                 kind: "image",
+                thumbnail: Some(thumbnail),
             });
         }
         return Ok(ProcessedUpload {
@@ -650,6 +744,7 @@ fn process_upload(
             mime_type: mime_type.to_string(),
             extension: extension_for(filename, mime_type),
             kind: "image",
+            thumbnail: Some(thumbnail),
         });
     }
     if !is_document(mime_type) {
@@ -673,6 +768,7 @@ fn process_upload(
         mime_type: mime_type.to_string(),
         extension: extension_for(filename, mime_type),
         kind: "document",
+        thumbnail: None,
     })
 }
 
@@ -749,10 +845,26 @@ async fn transcode_video(
         ));
     }
     let output = std::env::temp_dir().join(format!("eco-video-out-{}.mp4", Uuid::new_v4()));
-    if run_ffmpeg(input, &output, true).await.is_err() {
-        // Silent clips (no audio track) fail the audio-mapped encode; retry
-        // dropping audio entirely instead of rejecting the upload.
-        run_ffmpeg(input, &output, false).await?;
+    let result = match run_ffmpeg(input, &output, true).await {
+        Ok(()) => Ok(()),
+        Err((StatusCode::REQUEST_TIMEOUT, _)) => {
+            // A stalled encode should not be retried as if it were a silent
+            // clip — surface the timeout to the user instead.
+            Err((
+                StatusCode::REQUEST_TIMEOUT,
+                "Pemrosesan video memakan waktu terlalu lama. Coba video yang lebih pendek atau lebih kecil.".to_string(),
+            ))
+        }
+        Err(_) => {
+            // Silent clips (no audio track) fail the audio-mapped encode;
+            // retry dropping audio entirely instead of rejecting the upload.
+            run_ffmpeg(input, &output, false).await
+        }
+    };
+    if let Err((status, message)) = result {
+        // Remove the temp output on failure so we never leak it.
+        let _ = tokio::fs::remove_file(&output).await;
+        return Err((status, message));
     }
     let size_bytes = tokio::fs::metadata(&output)
         .await
@@ -822,14 +934,26 @@ async fn run_ffmpeg(
         .arg(output)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let status = command.status().await.map_err(bad_request)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err((
+
+    // A stalled or impossibly slow encode must not hold the upload request
+    // (and the Cloudflare tunnel) open forever. Cap it, then kill the child.
+    let mut child = command.spawn().map_err(bad_request)?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await;
+    match status {
+        Ok(Ok(exit)) if exit.success() => Ok(()),
+        Ok(Ok(_)) => Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "ffmpeg gagal memproses video".to_string(),
-        ))
+        )),
+        Ok(Err(error)) => Err(bad_request(error)),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err((
+                StatusCode::REQUEST_TIMEOUT,
+                "ffmpeg gagal memproses video".to_string(),
+            ))
+        }
     }
 }
 
@@ -938,6 +1062,11 @@ fn stored_object_from_head(
     content_type: Option<&str>,
     content_length: i64,
 ) -> StoredObject {
+    let kind = metadata
+        .get("kind")
+        .cloned()
+        .unwrap_or_else(|| "document".to_string());
+    let key_trimmed_webp = key.trim_end_matches(".webp").to_string();
     StoredObject {
         key,
         original_name: metadata
@@ -948,10 +1077,10 @@ fn stored_object_from_head(
             .unwrap_or("application/octet-stream")
             .to_string(),
         size_bytes: content_length.max(0) as u64,
-        kind: metadata
-            .get("kind")
-            .cloned()
-            .unwrap_or_else(|| "document".to_string()),
+        thumbnail_key: (kind == "image").then(|| {
+            format!("{}-thumb.webp", key_trimmed_webp)
+        }),
+        kind,
         owner_id: metadata.get("owner-id").cloned().unwrap_or_default(),
         namespace: metadata.get("namespace").cloned().unwrap_or_default(),
         reference_id: metadata.get("reference-id").cloned().unwrap_or_default(),
@@ -981,6 +1110,17 @@ mod tests {
     use super::*;
     use image::{codecs::jpeg::JpegEncoder, ImageBuffer, Rgb};
 
+    fn test_limits() -> UploadLimits {
+        UploadLimits {
+            max_image_bytes: 10 * 1024 * 1024,
+            max_document_bytes: 50 * 1024 * 1024,
+            max_image_pixels: 40_000_000,
+            max_video_bytes: 200 * 1024 * 1024,
+            image_max_dimension: 1600,
+            thumbnail_dimension: 400,
+        }
+    }
+
     #[test]
     fn image_conversion_never_increases_the_stored_file_size() {
         let image = ImageBuffer::from_pixel(320, 240, Rgb([32u8, 83, 158]));
@@ -989,17 +1129,40 @@ mod tests {
             .encode_image(&image)
             .unwrap();
 
-        let limits = UploadLimits {
-            max_image_bytes: 10 * 1024 * 1024,
-            max_document_bytes: 50 * 1024 * 1024,
-            max_image_pixels: 40_000_000,
-            max_video_bytes: 200 * 1024 * 1024,
-        };
-        let stored = process_upload(limits, &jpeg, "image/jpeg", "inventory.jpg").unwrap();
+        let stored = process_upload(test_limits(), &jpeg, "image/jpeg", "inventory.jpg").unwrap();
         assert!(stored.size_bytes <= jpeg.len());
         if stored.mime_type == "image/webp" {
             assert!(stored.size_bytes < jpeg.len());
         }
+    }
+
+    #[test]
+    fn images_are_downscaled_and_thumbnail_is_small() {
+        let mut image = ImageBuffer::new(3000, 2000);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let r = (x * 255 / 3000) as u8;
+            let g = (y * 255 / 2000) as u8;
+            let b = ((x + y) * 255 / 5000) as u8;
+            *pixel = Rgb([r, g, b]);
+        }
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&image)
+            .unwrap();
+
+        let stored = process_upload(test_limits(), &jpeg, "image/jpeg", "huge.jpg").unwrap();
+        // Main image must have been downscaled from 3000px to <= 1600px.
+        assert_eq!(stored.extension, "webp");
+        let decoded = image::load_from_memory(&stored.bytes).unwrap();
+        let (w, h) = decoded.dimensions();
+        assert!(w.max(h) <= 1600, "main image still {w}x{h}");
+
+        // Thumbnail must exist and be within the thumbnail dimension.
+        let thumb = stored.thumbnail.expect("thumbnail should be generated");
+        let thumb_image = image::load_from_memory(&thumb).unwrap();
+        let (tw, th) = thumb_image.dimensions();
+        assert!(tw.max(th) <= 400, "thumbnail still {tw}x{th}");
+        assert!(thumb.len() < stored.bytes.len(), "thumbnail not smaller than main");
     }
 
     #[test]
@@ -1041,14 +1204,31 @@ mod tests {
 
     #[test]
     fn video_size_cap_is_reported_in_mb() {
-        let limits = UploadLimits {
-            max_image_bytes: 10 * 1024 * 1024,
-            max_document_bytes: 50 * 1024 * 1024,
-            max_image_pixels: 40_000_000,
-            max_video_bytes: 200 * 1024 * 1024,
-        };
+        let limits = test_limits();
         assert_eq!(max_body_bytes(limits), 200 * 1024 * 1024);
         assert_eq!(limits.max_video_bytes / (1024 * 1024), 200);
+    }
+
+    #[test]
+    fn thumbnail_key_derivation() {
+        let head = HashMap::new();
+        let obj = stored_object_from_head(
+            "inventory/abc/123.webp".to_string(),
+            &head,
+            Some("image/webp"),
+            42,
+        );
+        // kind is empty here (no metadata), so no thumbnail key.
+        assert_eq!(obj.thumbnail_key, None);
+        let mut meta = HashMap::new();
+        meta.insert("kind".to_string(), "image".to_string());
+        let obj2 = stored_object_from_head(
+            "inventory/abc/123.webp".to_string(),
+            &meta,
+            Some("image/webp"),
+            42,
+        );
+        assert_eq!(obj2.thumbnail_key, Some("inventory/abc/123-thumb.webp".to_string()));
     }
 
     #[test]
@@ -1080,12 +1260,7 @@ mod tests {
                 .expect("ffmpeg test clip generation failed");
             assert!(generated.status.success(), "test clip generation failed");
 
-            let limits = UploadLimits {
-                max_image_bytes: 10 * 1024 * 1024,
-                max_document_bytes: 50 * 1024 * 1024,
-                max_image_pixels: 40_000_000,
-                max_video_bytes: 200 * 1024 * 1024,
-            };
+            let limits = test_limits();
             let result = transcode_video(limits, &source, "test-clip.mov")
                 .await
                 .expect("transcode failed");
