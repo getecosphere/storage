@@ -20,9 +20,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use webp::Encoder;
 
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-const MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
-const MAX_IMAGE_PIXELS: u32 = 40_000_000;
+#[derive(Debug, Clone, Copy)]
+pub struct UploadLimits {
+    pub max_image_bytes: usize,
+    pub max_document_bytes: usize,
+    pub max_image_pixels: u32,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredObject {
@@ -53,6 +56,7 @@ pub struct DeleteObjectQuery {
 pub struct AppState {
     client: Client,
     bucket: String,
+    limits: UploadLimits,
 }
 
 #[tokio::main]
@@ -66,6 +70,11 @@ async fn main() {
     let endpoint = required_env("S3_ENDPOINT");
     let bucket = env("S3_BUCKET", "eco-storage");
     let region = env("S3_REGION", "us-east-1");
+    let limits = UploadLimits {
+        max_image_bytes: (env_u64("MAX_IMAGE_MB", 10) * 1024 * 1024) as usize,
+        max_document_bytes: (env_u64("MAX_DOCUMENT_MB", 50) * 1024 * 1024) as usize,
+        max_image_pixels: env_u64("MAX_IMAGE_PIXELS", 40_000_000) as u32,
+    };
     let credentials = Credentials::new(
         required_env("S3_ACCESS_KEY"),
         required_env("S3_SECRET_KEY"),
@@ -85,6 +94,7 @@ async fn main() {
     let state = AppState {
         client: Client::from_conf(s3_config),
         bucket,
+        limits,
     };
     ensure_bucket(&state)
         .await
@@ -104,15 +114,15 @@ async fn main() {
             "/api/storage/objects/*key",
             get(object_metadata).delete(delete_object),
         )
-        .layer(RequestBodyLimitLayer::new(MAX_DOCUMENT_BYTES))
+        .layer(RequestBodyLimitLayer::new(state.limits.max_document_bytes))
         // axum's Multipart extractor reads DefaultBodyLimit (via
         // with_limited_body) and defaults to 2MB; the tower_http
         // RequestBodyLimitLayer above does not raise it. Without this, any
         // upload over ~2MB fails multipart parsing with a 400. Set it just
         // above the image cap so an oversize image is parsed and then
-        // rejected by process_upload's clear "Ukuran gambar maksimal 5 MB"
+        // rejected by process_upload's clear "Ukuran gambar maksimal 10 MB"
         // message instead of the generic multipart parse error.
-        .layer(DefaultBodyLimit::max(MAX_IMAGE_BYTES + 1024 * 1024))
+        .layer(DefaultBodyLimit::max(state.limits.max_image_bytes + 1024 * 1024))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -129,6 +139,13 @@ async fn main() {
 
 fn env(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_string())
+}
+
+fn env_u64(name: &str, fallback: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn required_env(name: &str) -> String {
@@ -190,7 +207,7 @@ async fn upload_object(
         )
     })?;
     let declared_type = content_type.unwrap_or_else(|| mime_from_name(&original_name));
-    let processed = process_upload(&input, &declared_type, &original_name)?;
+    let processed = process_upload(state.limits, &input, &declared_type, &original_name)?;
     let key = format!(
         "{namespace}/{reference_id}/{}.{}",
         Uuid::new_v4(),
@@ -378,15 +395,19 @@ struct ProcessedUpload {
 }
 
 fn process_upload(
+    limits: UploadLimits,
     bytes: &[u8],
     mime_type: &str,
     filename: &str,
 ) -> Result<ProcessedUpload, (StatusCode, String)> {
     if is_image(mime_type) {
-        if bytes.len() > MAX_IMAGE_BYTES {
+        if bytes.len() > limits.max_image_bytes {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Ukuran gambar maksimal 5 MB".to_string(),
+                format!(
+                    "Ukuran gambar maksimal {} MB",
+                    limits.max_image_bytes / (1024 * 1024)
+                ),
             ));
         }
         let image = image::load_from_memory(bytes).map_err(|_| {
@@ -396,7 +417,7 @@ fn process_upload(
             )
         })?;
         let (width, height) = image.dimensions();
-        if width.saturating_mul(height) > MAX_IMAGE_PIXELS {
+        if width.saturating_mul(height) > limits.max_image_pixels {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Resolusi gambar terlalu besar".to_string(),
@@ -434,10 +455,13 @@ fn process_upload(
             "Jenis file tidak didukung".to_string(),
         ));
     }
-    if bytes.len() > MAX_DOCUMENT_BYTES {
+    if bytes.len() > limits.max_document_bytes {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
-            "Ukuran dokumen maksimal 50 MB".to_string(),
+            format!(
+                "Ukuran dokumen maksimal {} MB",
+                limits.max_document_bytes / (1024 * 1024)
+            ),
         ));
     }
     Ok(ProcessedUpload {
@@ -604,7 +628,12 @@ mod tests {
             .encode_image(&image)
             .unwrap();
 
-        let stored = process_upload(&jpeg, "image/jpeg", "inventory.jpg").unwrap();
+        let limits = UploadLimits {
+            max_image_bytes: 10 * 1024 * 1024,
+            max_document_bytes: 50 * 1024 * 1024,
+            max_image_pixels: 40_000_000,
+        };
+        let stored = process_upload(limits, &jpeg, "image/jpeg", "inventory.jpg").unwrap();
         assert!(stored.size_bytes <= jpeg.len());
         if stored.mime_type == "image/webp" {
             assert!(stored.size_bytes < jpeg.len());

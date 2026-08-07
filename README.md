@@ -18,6 +18,9 @@ photos/
 * `S3_BUCKET`: Storage bucket name
 * `S3_ACCESS_KEY`: S3 access key
 * `S3_SECRET_KEY`: S3 secret key
+* `MAX_IMAGE_MB`: Max image upload size in MB (default: 10)
+* `MAX_DOCUMENT_MB`: Max document upload size in MB (default: 50)
+* `MAX_IMAGE_PIXELS`: Max image pixel count, width × height (default: 40000000)
 
 ## API
 
