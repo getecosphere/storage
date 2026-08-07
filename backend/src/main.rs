@@ -251,37 +251,41 @@ async fn upload_object(
         ));
     }
 
-    let (put_body, mime_type, extension, kind, size_bytes) = if let Some(input_path) = video_input {
-        let transcoded = transcode_video(state.limits, &input_path, &original_name).await?;
-        let body = ByteStream::from_path(&transcoded.path)
-            .await
-            .map_err(s3_error)?;
-        // The input and transcoded temp files are no longer needed once the
-        // body has been handed to S3 (ByteStream::from_path opens the file).
-        let _ = tokio::fs::remove_file(&input_path).await;
-        let _ = tokio::fs::remove_file(&transcoded.path).await;
-        (
-            body,
-            transcoded.mime_type,
-            transcoded.extension,
-            transcoded.kind,
-            transcoded.size_bytes,
-        )
-    } else {
-        let processed = process_upload(
-            state.limits,
-            bytes.as_deref().unwrap_or_default(),
-            &declared_type,
-            &original_name,
-        )?;
-        (
-            ByteStream::from(processed.bytes),
-            processed.mime_type,
-            processed.extension,
-            processed.kind,
-            processed.size_bytes as u64,
-        )
-    };
+    let (put_body, mime_type, extension, kind, size_bytes, output_to_clean) =
+        if let Some(input_path) = video_input {
+            let transcoded = transcode_video(state.limits, &input_path, &original_name).await?;
+            // The input is fully consumed by ffmpeg, so it can go now. The
+            // transcoded output must survive until S3 reads it: ByteStream::
+            // from_path is lazy and only opens the file when the stream is
+            // polled, so deleting it here fails the PutObject.
+            let _ = tokio::fs::remove_file(&input_path).await;
+            let body = ByteStream::from_path(&transcoded.path)
+                .await
+                .map_err(s3_error)?;
+            (
+                body,
+                transcoded.mime_type,
+                transcoded.extension,
+                transcoded.kind,
+                transcoded.size_bytes,
+                Some(transcoded.path),
+            )
+        } else {
+            let processed = process_upload(
+                state.limits,
+                bytes.as_deref().unwrap_or_default(),
+                &declared_type,
+                &original_name,
+            )?;
+            (
+                ByteStream::from(processed.bytes),
+                processed.mime_type,
+                processed.extension,
+                processed.kind,
+                processed.size_bytes as u64,
+                None,
+            )
+        };
     let key = format!(
         "{namespace}/{reference_id}/{}.{}",
         Uuid::new_v4(),
@@ -305,6 +309,9 @@ async fn upload_object(
         .send()
         .await
         .map_err(s3_error)?;
+    if let Some(path) = output_to_clean {
+        let _ = tokio::fs::remove_file(path).await;
+    }
 
     Ok((
         StatusCode::CREATED,
