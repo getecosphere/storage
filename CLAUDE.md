@@ -103,6 +103,12 @@ repos — bump the backend `MAX_IMAGE_MB`/`MAX_DOCUMENT_MB` *and* the frontend
 `PUBLIC_MAX_PHOTO_MB`, then verify live (e.g. a >5MB image returns 415
 "File gambar tidak valid" rather than 413 "Ukuran gambar maksimal 5 MB").
 
+Videos have the same pairing: backend `MAX_VIDEO_MB` ↔ frontend
+`PUBLIC_MAX_VIDEO_MB` (default `200`), enforced in
+`inventory/form/index.astro` via `MAX_VIDEO_BYTES` on `video/*` files. The
+client-side cap applies to the *uploaded* file size, before ffmpeg compresses
+it.
+
 ## API
 
 Base path `/api/storage`. Consumers on the stuff8 estate reach it through the
