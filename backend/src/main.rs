@@ -413,19 +413,36 @@ async fn list_objects(
     Ok(Json(objects))
 }
 
+/// HEAD an object, mapping a genuinely missing key to a clean 404 (instead of
+/// 502) so the `onerror` thumbnail fallback and HTTP caches behave correctly.
+/// All S3-level failures still surface as 502 via `s3_error`.
+async fn head_object_checked(
+    state: &AppState,
+    key: &str,
+) -> Result<aws_sdk_s3::operation::head_object::HeadObjectOutput, (StatusCode, String)> {
+    match state
+        .client
+        .head_object()
+        .bucket(&state.bucket)
+        .key(key)
+        .send()
+        .await
+    {
+        Ok(head) => Ok(head),
+        Err(error) if error.as_service_error().is_some_and(|e| e.is_not_found()) => Err((
+            StatusCode::NOT_FOUND,
+            "File tidak ditemukan".to_string(),
+        )),
+        Err(error) => Err(s3_error(error)),
+    }
+}
+
 async fn object_metadata(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Json<StoredObject>, (StatusCode, String)> {
     let key = valid_key(&key)?;
-    let head = state
-        .client
-        .head_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .send()
-        .await
-        .map_err(s3_error)?;
+    let head = head_object_checked(&state, &key).await?;
     Ok(Json(stored_object_from_head(
         key,
         &head.metadata().cloned().unwrap_or_default(),
@@ -440,14 +457,7 @@ async fn download_object(
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let key = valid_key(&key)?;
-    let head = state
-        .client
-        .head_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .send()
-        .await
-        .map_err(s3_error)?;
+    let head = head_object_checked(&state, &key).await?;
     let total = head.content_length().unwrap_or(0).max(0) as u64;
 
     match headers
@@ -539,14 +549,7 @@ async fn download_headers(
     Path(key): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let key = valid_key(&key)?;
-    let head = state
-        .client
-        .head_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .send()
-        .await
-        .map_err(s3_error)?;
+    let head = head_object_checked(&state, &key).await?;
     let mime = head
         .content_type()
         .unwrap_or("application/octet-stream")
@@ -598,14 +601,7 @@ async fn delete_object(
     Query(query): Query<DeleteObjectQuery>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let key = valid_key(&key)?;
-    let head = state
-        .client
-        .head_object()
-        .bucket(&state.bucket)
-        .key(&key)
-        .send()
-        .await
-        .map_err(s3_error)?;
+    let head = head_object_checked(&state, &key).await?;
     if head
         .metadata()
         .and_then(|meta| meta.get("owner-id"))
