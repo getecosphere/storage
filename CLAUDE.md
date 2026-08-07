@@ -1,9 +1,10 @@
 # photos
 
-Reusable storage domain for any Eco estate. It stores images and documents in
-S3-compatible MinIO and hands consumers opaque object keys, never S3 details.
-Images are converted to WebP when that is smaller; PDF, Word, Excel, and text
-documents are stored as-is.
+Reusable storage domain for any Eco estate. It stores images, documents, and
+videos in S3-compatible MinIO and hands consumers opaque object keys, never S3
+details. Images are converted to WebP when that is smaller; PDF, Word, Excel,
+and text documents are stored as-is; videos are re-encoded to MP4 (H.264/AAC)
+with `ffmpeg`.
 
 ## Structure
 
@@ -20,10 +21,66 @@ service `.env` (defaults live in `backend/.env.example`):
 - `MAX_IMAGE_MB` (default `10`) — image size cap
 - `MAX_DOCUMENT_MB` (default `50`) — document size cap
 - `MAX_IMAGE_PIXELS` (default `40000000`) — image pixel-count cap (width × height)
+- `MAX_VIDEO_MB` (default `200`) — video size cap (checked on the *uploaded*
+  file, before ffmpeg compresses it)
 
 They are loaded into `UploadLimits` on `AppState` in `backend/src/main.rs`
-and drive both the tower_http/axum body limits and the `process_upload`
-rejection messages (which render the configured MB value, not a literal).
+and drive both the tower_http/axum body limits and the `process_upload` /
+`transcode_video` rejection messages (which render the configured MB value,
+not a literal). Body limits use the **largest** kind via `max_body_bytes()`.
+
+## Videos
+
+### Compression (upload)
+
+Uploads with a video MIME type (`is_video()`) skip the in-memory image/doc
+path. `upload_object` streams the multipart field to a temp file (never
+buffers it in RAM), then `transcode_video()` runs `ffmpeg`:
+
+```
+ffmpeg -y -i <input> -c:v libx264 -preset fast -crf 26 -maxrate 2M -bufsize 4M \
+  -vf "scale='min(1280,iw)':-2" -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k \
+  -movflags +faststart -f mp4 <output>
+```
+
+Output is always `video/mp4`, stored with `kind: "video"`, original uploaded
+extension replaced by `.mp4`. **Silent clips** (no audio stream) fail the
+audio-mapped encode; the code retries once with `-an`. Transcoding is
+synchronous — fine for short product carousel clips (~seconds on the estate),
+but NOT for long course videos: those will need an async job + status
+endpoint before going live.
+
+### Delivery (streaming)
+
+`GET /api/storage/content/*key` is Range-aware: single `Range: bytes=…`
+headers get `206 Partial Content` + `Content-Range` + `Accept-Ranges: bytes`,
+streamed from S3 via `into_async_read()` + `ReaderStream` (never collected
+into RAM like the old code did). `<video src>` therefore starts instantly and
+seeks. HEAD is served by `download_headers()` for probing. Suffix/multi-range
+headers fall back to a plain `200` full object. Videos are served
+`Content-Disposition: inline`.
+
+### Course videos (future, designed not built)
+
+Same Range endpoint, but protected: sign `key + expiry` with a shared HMAC
+secret and stream only when the `?token=` validates. The frontend (course
+domain) checks enrollment before issuing the token. The photos API has no
+auth today — do not expose course URLs unauthenticated.
+
+### Gotchas
+
+- **ffmpeg is a runtime dependency, not a Cargo dep.** If it's missing the
+  video upload returns `ffmpeg tidak ditemukan` (the `Command::new` error
+  path). Add `ffmpeg` to the estate `ecompose.yml` `shared_tools` so Eco
+  installs it. CT 101 (10 cores / 4GB RAM) is fine for short carousel clips,
+  tight for long course encodes — see the async-job note above.
+- **Cloudflare edge caps request bodies ~100MB on the free plan.** A
+  `MAX_VIDEO_MB` above that means very large uploads fail at Cloudflare before
+  reaching this backend. Carousel clips are far below this; >100MB course
+  uploads need presigned direct-to-MinIO or Cloudflare Stream (both designed
+  for later, not built).
+- The body-limit layers must always cover the largest kind or oversize videos
+  get a generic multipart 400 instead of "Ukuran video maksimal 200 MB".
 
 ## Gotcha: the frontend enforces its own limit too (2026-08-07)
 
@@ -53,11 +110,12 @@ estate gateway as `/api/...` or the `photos.stuff8.com` hostname
 (`expose.additional` in `ecompose.yml`).
 
 - `POST /api/storage/objects` — multipart `file`, `owner_id`, `namespace`,
-  `reference_id` → stores and returns object metadata
+  `reference_id` → stores and returns object metadata. Images → WebP when
+  smaller; documents stored as-is; videos → ffmpeg MP4 (`kind: "video"`)
 - `GET /api/storage/objects?owner_id=&namespace=&reference_id=` — list owned
   objects
-- `GET /api/storage/content/*key` — retrieve content (images served inline so
-  email clients render them)
+- `GET /api/storage/content/*key` — retrieve content (Range streaming; images
+  and videos served inline so browsers render/play them in place)
 - `GET /api/storage/objects/*key` — object metadata
 - `DELETE /api/storage/objects/*key?owner_id=` — remove an owned object
 

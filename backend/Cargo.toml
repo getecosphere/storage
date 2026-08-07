@@ -7,6 +7,7 @@ description = "Stuff8 Photos Domain Service — Handles media upload, processing
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 axum = { version = "0.7", features = ["multipart"] }
 tower-http = { version = "0.5", features = ["cors", "limit"] }
 serde = { version = "1.0", features = ["derive"] }

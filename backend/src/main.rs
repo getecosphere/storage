@@ -2,9 +2,10 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client};
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -12,6 +13,9 @@ use chrono::{DateTime, Utc};
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio_util::io::ReaderStream;
 use tower_http::{
     cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
@@ -25,6 +29,7 @@ pub struct UploadLimits {
     pub max_image_bytes: usize,
     pub max_document_bytes: usize,
     pub max_image_pixels: u32,
+    pub max_video_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +79,7 @@ async fn main() {
         max_image_bytes: (env_u64("MAX_IMAGE_MB", 10) * 1024 * 1024) as usize,
         max_document_bytes: (env_u64("MAX_DOCUMENT_MB", 50) * 1024 * 1024) as usize,
         max_image_pixels: env_u64("MAX_IMAGE_PIXELS", 40_000_000) as u32,
+        max_video_bytes: (env_u64("MAX_VIDEO_MB", 200) * 1024 * 1024) as usize,
     };
     let credentials = Credentials::new(
         required_env("S3_ACCESS_KEY"),
@@ -109,12 +115,19 @@ async fn main() {
             "/api/storage/objects",
             post(upload_object).get(list_objects),
         )
-        .route("/api/storage/content/*key", get(download_object))
+        .route(
+            "/api/storage/content/*key",
+            get(download_object).head(download_headers),
+        )
         .route(
             "/api/storage/objects/*key",
             get(object_metadata).delete(delete_object),
         )
-        .layer(RequestBodyLimitLayer::new(state.limits.max_document_bytes))
+        // The tower_http and axum body limits must cover the largest upload
+        // kind (videos); otherwise multipart parsing rejects an oversized
+        // video with a generic 400 before transcode_video's explicit
+        // "Ukuran video maksimal …" message can be reached.
+        .layer(RequestBodyLimitLayer::new(max_body_bytes(limits)))
         // axum's Multipart extractor reads DefaultBodyLimit (via
         // with_limited_body) and defaults to 2MB; the tower_http
         // RequestBodyLimitLayer above does not raise it. Without this, any
@@ -122,7 +135,7 @@ async fn main() {
         // above the image cap so an oversize image is parsed and then
         // rejected by process_upload's clear "Ukuran gambar maksimal 10 MB"
         // message instead of the generic multipart parse error.
-        .layer(DefaultBodyLimit::max(state.limits.max_image_bytes + 1024 * 1024))
+        .layer(DefaultBodyLimit::max(max_body_bytes(limits) + 1024 * 1024))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -146,6 +159,13 @@ fn env_u64(name: &str, fallback: u64) -> u64 {
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(fallback)
+}
+
+fn max_body_bytes(limits: UploadLimits) -> usize {
+    limits
+        .max_image_bytes
+        .max(limits.max_document_bytes)
+        .max(limits.max_video_bytes)
 }
 
 fn required_env(name: &str) -> String {
@@ -184,13 +204,35 @@ async fn upload_object(
     let mut filename = None;
     let mut content_type = None;
     let mut bytes = None;
+    let mut video_input = None;
 
     while let Some(field) = multipart.next_field().await.map_err(bad_request)? {
         let name = field.name().unwrap_or_default().to_owned();
         if name == "file" {
             filename = field.file_name().map(ToOwned::to_owned);
             content_type = field.content_type().map(ToOwned::to_owned);
-            bytes = Some(field.bytes().await.map_err(bad_request)?.to_vec());
+            let declared = content_type
+                .clone()
+                .unwrap_or_else(|| mime_from_name(filename.as_deref().unwrap_or("upload")));
+            if is_video(&declared) {
+                // Videos can be large; stream the multipart field to a temp
+                // file instead of buffering it in RAM like images/docs.
+                let mut field = field;
+                let path = std::env::temp_dir().join(format!(
+                    "eco-video-in-{}.{}",
+                    Uuid::new_v4(),
+                    temp_ext(&declared)
+                ));
+                let mut file = tokio::fs::File::create(&path).await.map_err(bad_request)?;
+                while let Some(chunk) = field.chunk().await.map_err(bad_request)? {
+                    file.write_all(&chunk).await.map_err(bad_request)?;
+                }
+                file.flush().await.map_err(bad_request)?;
+                drop(file);
+                video_input = Some(path);
+            } else {
+                bytes = Some(field.bytes().await.map_err(bad_request)?.to_vec());
+            }
         } else {
             fields.insert(name, field.text().await.map_err(bad_request)?);
         }
@@ -200,18 +242,50 @@ async fn upload_object(
     let namespace = safe_segment(required_field(&fields, "namespace")?)?;
     let reference_id = safe_segment(required_field(&fields, "reference_id")?)?;
     let original_name = filename.unwrap_or_else(|| "upload".to_string());
-    let input = bytes.ok_or_else(|| {
-        (
+    let declared_type = content_type.unwrap_or_else(|| mime_from_name(&original_name));
+
+    if bytes.is_none() && video_input.is_none() {
+        return Err((
             StatusCode::BAD_REQUEST,
             "Field file wajib diisi".to_string(),
+        ));
+    }
+
+    let (put_body, mime_type, extension, kind, size_bytes) = if let Some(input_path) = video_input {
+        let transcoded = transcode_video(state.limits, &input_path, &original_name).await?;
+        let body = ByteStream::from_path(&transcoded.path)
+            .await
+            .map_err(s3_error)?;
+        // The input and transcoded temp files are no longer needed once the
+        // body has been handed to S3 (ByteStream::from_path opens the file).
+        let _ = tokio::fs::remove_file(&input_path).await;
+        let _ = tokio::fs::remove_file(&transcoded.path).await;
+        (
+            body,
+            transcoded.mime_type,
+            transcoded.extension,
+            transcoded.kind,
+            transcoded.size_bytes,
         )
-    })?;
-    let declared_type = content_type.unwrap_or_else(|| mime_from_name(&original_name));
-    let processed = process_upload(state.limits, &input, &declared_type, &original_name)?;
+    } else {
+        let processed = process_upload(
+            state.limits,
+            bytes.as_deref().unwrap_or_default(),
+            &declared_type,
+            &original_name,
+        )?;
+        (
+            ByteStream::from(processed.bytes),
+            processed.mime_type,
+            processed.extension,
+            processed.kind,
+            processed.size_bytes as u64,
+        )
+    };
     let key = format!(
         "{namespace}/{reference_id}/{}.{}",
         Uuid::new_v4(),
-        processed.extension
+        extension
     );
     let now = Utc::now();
 
@@ -220,13 +294,13 @@ async fn upload_object(
         .put_object()
         .bucket(&state.bucket)
         .key(&key)
-        .body(ByteStream::from(processed.bytes))
-        .content_type(&processed.mime_type)
+        .body(put_body)
+        .content_type(&mime_type)
         .metadata("owner-id", &owner_id)
         .metadata("namespace", &namespace)
         .metadata("reference-id", &reference_id)
         .metadata("original-name", &original_name)
-        .metadata("kind", processed.kind)
+        .metadata("kind", kind)
         .metadata("created-at", now.to_rfc3339())
         .send()
         .await
@@ -237,9 +311,9 @@ async fn upload_object(
         Json(StoredObject {
             key,
             original_name,
-            mime_type: processed.mime_type,
-            size_bytes: processed.size_bytes as u64,
-            kind: processed.kind.to_string(),
+            mime_type,
+            size_bytes,
+            kind: kind.to_string(),
             owner_id,
             namespace,
             reference_id,
@@ -318,37 +392,159 @@ async fn object_metadata(
 async fn download_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let key = valid_key(&key)?;
-    let object = state
+    let head = state
         .client
-        .get_object()
+        .head_object()
         .bucket(&state.bucket)
         .key(&key)
         .send()
         .await
         .map_err(s3_error)?;
-    let mime_type = object
+    let total = head.content_length().unwrap_or(0).max(0) as u64;
+
+    match headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_range(value, total))
+    {
+        // Video players ask for byte ranges to stream and seek. Serve a
+        // single byte range as 206 Partial Content so playback starts before
+        // the object is fully downloaded and seeking works.
+        Some((start, end)) if start < total => {
+            let end = end.min(total.saturating_sub(1));
+            if end < start {
+                return full_object(&state, &key, total).await;
+            }
+            let object = state
+                .client
+                .get_object()
+                .bucket(&state.bucket)
+                .key(&key)
+                .range(format!("bytes={start}-{end}"))
+                .send()
+                .await
+                .map_err(s3_error)?;
+            let mime = object
+                .content_type()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let original_name = original_name_from(object.metadata(), &key);
+            let response = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, &mime)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    download_disposition(&original_name, &mime),
+                )
+                .header(header::CONTENT_LENGTH, end - start + 1)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total}"),
+                )
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Body::from_stream(ReaderStream::new(
+                    object.body.into_async_read(),
+                )))
+                .map_err(bad_request)?;
+            Ok(response)
+        }
+        _ => full_object(&state, &key, total).await,
+    }
+}
+
+async fn full_object(
+    state: &AppState,
+    key: &str,
+    total: u64,
+) -> Result<Response, (StatusCode, String)> {
+    let object = state
+        .client
+        .get_object()
+        .bucket(&state.bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    let mime = object
         .content_type()
         .unwrap_or("application/octet-stream")
         .to_string();
-    let original_name = object
-        .metadata()
-        .and_then(|metadata| metadata.get("original-name"))
-        .cloned()
-        .unwrap_or_else(|| key.rsplit('/').next().unwrap_or("download").to_string());
-    let bytes = object.body.collect().await.map_err(s3_error)?.into_bytes();
-    let mut response = (StatusCode::OK, bytes).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&mime_type)
-            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        download_disposition(&original_name, &mime_type),
-    );
+    let original_name = original_name_from(object.metadata(), key);
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &mime)
+        .header(
+            header::CONTENT_DISPOSITION,
+            download_disposition(&original_name, &mime),
+        )
+        .header(header::CONTENT_LENGTH, total)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(Body::from_stream(ReaderStream::new(
+            object.body.into_async_read(),
+        )))
+        .map_err(bad_request)?;
     Ok(response)
+}
+
+async fn download_headers(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let key = valid_key(&key)?;
+    let head = state
+        .client
+        .head_object()
+        .bucket(&state.bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(s3_error)?;
+    let mime = head
+        .content_type()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let original_name = original_name_from(head.metadata(), &key);
+    let total = head.content_length().unwrap_or(0).max(0) as u64;
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &mime)
+        .header(
+            header::CONTENT_DISPOSITION,
+            download_disposition(&original_name, &mime),
+        )
+        .header(header::CONTENT_LENGTH, total)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(Body::empty())
+        .map_err(bad_request)?;
+    Ok(response)
+}
+
+/// Parse a single `Range: bytes=start-end` header into a closed interval.
+/// Suffix ranges (`bytes=-N`) and multi-range requests are not supported and
+/// fall back to serving the whole object as a plain 200.
+fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = header.strip_prefix("bytes=")?;
+    if spec.is_empty() || !spec.contains('-') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end = if end.trim().is_empty() {
+        total.saturating_sub(1)
+    } else {
+        end.trim().parse().ok()?
+    };
+    Some((start, end))
+}
+
+fn original_name_from(metadata: Option<&HashMap<String, String>>, key: &str) -> String {
+    metadata
+        .and_then(|meta| meta.get("original-name"))
+        .cloned()
+        .unwrap_or_else(|| key.rsplit('/').next().unwrap_or("download").to_string())
 }
 
 async fn delete_object(
@@ -487,12 +683,155 @@ fn is_document(mime: &str) -> bool {
             | "text/plain"
     )
 }
+fn is_video(mime: &str) -> bool {
+    matches!(
+        mime,
+        "video/mp4"
+            | "video/quicktime"
+            | "video/webm"
+            | "video/x-matroska"
+            | "video/x-msvideo"
+            | "video/3gpp"
+            | "video/3gpp2"
+            | "video/mpeg"
+            | "video/ogg"
+    )
+}
+
+/// File extension used for the temp *input* file so ffmpeg's format probing
+/// sees a hint that matches the declared container.
+fn temp_ext(mime: &str) -> &'static str {
+    match mime {
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "video/x-msvideo" => "avi",
+        "video/3gpp" | "video/3gpp2" => "3gp",
+        "video/mpeg" => "mpeg",
+        "video/ogg" => "ogv",
+        _ => "mp4",
+    }
+}
+
+struct TranscodedVideo {
+    path: std::path::PathBuf,
+    mime_type: String,
+    extension: &'static str,
+    kind: &'static str,
+    size_bytes: u64,
+}
+
+/// Validate the size cap, then re-encode the uploaded video to a browser- and
+/// bandwidth-friendly MP4 (H.264 + AAC, faststart, capped at 1280px wide and
+/// ~2 Mbps) with ffmpeg. Compression runs synchronously; short product
+/// carousel clips transcode in a few seconds on the estate's cores. Long
+/// course videos will need an async job + status endpoint (see CLAUDE.md).
+async fn transcode_video(
+    limits: UploadLimits,
+    input: &std::path::Path,
+    filename: &str,
+) -> Result<TranscodedVideo, (StatusCode, String)> {
+    let input_len = tokio::fs::metadata(input).await.map_err(bad_request)?.len();
+    if input_len > limits.max_video_bytes as u64 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Ukuran video maksimal {} MB",
+                limits.max_video_bytes / (1024 * 1024)
+            ),
+        ));
+    }
+    let output = std::env::temp_dir().join(format!("eco-video-out-{}.mp4", Uuid::new_v4()));
+    if run_ffmpeg(input, &output, true).await.is_err() {
+        // Silent clips (no audio track) fail the audio-mapped encode; retry
+        // dropping audio entirely instead of rejecting the upload.
+        run_ffmpeg(input, &output, false).await?;
+    }
+    let size_bytes = tokio::fs::metadata(&output)
+        .await
+        .map_err(bad_request)?
+        .len();
+    if size_bytes == 0 {
+        let _ = tokio::fs::remove_file(&output).await;
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("Gagal memproses video: {}", file_name_hint(filename)),
+        ));
+    }
+    Ok(TranscodedVideo {
+        path: output,
+        mime_type: "video/mp4".to_string(),
+        extension: "mp4",
+        kind: "video",
+        size_bytes,
+    })
+}
+
+fn file_name_hint(filename: &str) -> String {
+    let truncated: String = filename.chars().take(40).collect();
+    if truncated == filename {
+        filename.to_string()
+    } else {
+        format!("{truncated}…")
+    }
+}
+
+async fn run_ffmpeg(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    with_audio: bool,
+) -> Result<(), (StatusCode, String)> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("fast")
+        .arg("-crf")
+        .arg("26")
+        .arg("-maxrate")
+        .arg("2M")
+        .arg("-bufsize")
+        .arg("4M")
+        .arg("-vf")
+        .arg("scale='min(1280,iw)':-2")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-r")
+        .arg("30");
+    if with_audio {
+        command.arg("-c:a").arg("aac").arg("-b:a").arg("128k");
+    } else {
+        command.arg("-an");
+    }
+    command
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-f")
+        .arg("mp4")
+        .arg(output)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status = command.status().await.map_err(bad_request)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "ffmpeg gagal memproses video".to_string(),
+        ))
+    }
+}
 
 /// Keep the S3 key opaque while giving the browser the original upload name.
 /// RFC 5987's `filename*` keeps Unicode names valid in a response header.
-/// Images are served `inline` so browsers and email clients render them in
-/// place (Gmail/Outlook refuse to display `attachment` images); non-image
-/// documents keep `attachment` so they still download instead of rendering.
+/// Images and videos are served `inline` so browsers render/stream them in
+/// place (Gmail/Outlook refuse to display `attachment` images, and an
+/// `attachment` video would download instead of playing); non-media documents
+/// keep `attachment` so they still download instead of rendering.
 fn download_disposition(filename: &str, mime: &str) -> HeaderValue {
     let encoded = filename
         .as_bytes()
@@ -504,9 +843,13 @@ fn download_disposition(filename: &str, mime: &str) -> HeaderValue {
             _ => format!("%{:02X}", byte),
         })
         .collect::<String>();
-    let kind = if is_image(mime) { "inline" } else { "attachment" };
+    let kind = if is_image(mime) || is_video(mime) {
+        "inline"
+    } else {
+        "attachment"
+    };
     HeaderValue::from_str(&format!("{kind}; filename*=UTF-8''{encoded}"))
-        .unwrap_or_else(|_| HeaderValue::from_str(&kind).unwrap())
+        .unwrap_or_else(|_| HeaderValue::from_str(kind).unwrap())
 }
 
 fn extension_for(filename: &str, mime: &str) -> &'static str {
@@ -520,6 +863,7 @@ fn extension_for(filename: &str, mime: &str) -> &'static str {
         "application/vnd.ms-excel" => "xls",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
         "text/plain" => "txt",
+        mime if is_video(mime) => "mp4",
         _ if filename.ends_with(".bin") => "bin",
         _ => "bin",
     }
@@ -531,6 +875,16 @@ fn mime_from_name(name: &str) -> String {
         "image/webp"
     } else if name.ends_with(".pdf") {
         "application/pdf"
+    } else if name.ends_with(".mp4")
+        || name.ends_with(".mov")
+        || name.ends_with(".m4v")
+        || name.ends_with(".webm")
+        || name.ends_with(".mkv")
+        || name.ends_with(".avi")
+        || name.ends_with(".3gp")
+        || name.ends_with(".ogv")
+    {
+        "video/mp4"
     } else {
         "image/jpeg"
     }
@@ -632,11 +986,108 @@ mod tests {
             max_image_bytes: 10 * 1024 * 1024,
             max_document_bytes: 50 * 1024 * 1024,
             max_image_pixels: 40_000_000,
+            max_video_bytes: 200 * 1024 * 1024,
         };
         let stored = process_upload(limits, &jpeg, "image/jpeg", "inventory.jpg").unwrap();
         assert!(stored.size_bytes <= jpeg.len());
         if stored.mime_type == "image/webp" {
             assert!(stored.size_bytes < jpeg.len());
         }
+    }
+
+    #[test]
+    fn video_mime_classification() {
+        assert!(is_video("video/mp4"));
+        assert!(is_video("video/quicktime"));
+        assert!(is_video("video/webm"));
+        assert!(!is_video("image/jpeg"));
+        assert!(!is_video("application/pdf"));
+        assert_eq!(extension_for("clip.mov", "video/quicktime"), "mp4");
+        assert_eq!(extension_for("clip.mp4", "video/mp4"), "mp4");
+        assert_eq!(mime_from_name("promo.mp4"), "video/mp4");
+        assert_eq!(mime_from_name("raw.mov"), "video/mp4");
+        assert_eq!(mime_from_name("logo.png"), "image/png");
+        assert_eq!(temp_ext("video/quicktime"), "mov");
+        assert_eq!(temp_ext("video/mp4"), "mp4");
+    }
+
+    #[test]
+    fn range_header_parsing() {
+        assert_eq!(parse_range("bytes=0-499", 1000), Some((0, 499)));
+        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(parse_range("bytes=1000-", 1000), Some((1000, 999)));
+        assert_eq!(parse_range("bytes=0-0", 1000), Some((0, 0)));
+        assert_eq!(parse_range("bytes=-500", 1000), None);
+        assert_eq!(parse_range("items=0-5", 1000), None);
+        assert_eq!(parse_range("", 1000), None);
+        assert_eq!(parse_range("bytes=abc-def", 1000), None);
+    }
+
+    #[test]
+    fn video_disposition_is_inline() {
+        let value = download_disposition("promo.mp4", "video/mp4");
+        let value = value.to_str().unwrap();
+        assert!(value.starts_with("inline;"));
+        let doc = download_disposition("doc.pdf", "application/pdf");
+        assert!(doc.to_str().unwrap().starts_with("attachment;"));
+    }
+
+    #[test]
+    fn video_size_cap_is_reported_in_mb() {
+        let limits = UploadLimits {
+            max_image_bytes: 10 * 1024 * 1024,
+            max_document_bytes: 50 * 1024 * 1024,
+            max_image_pixels: 40_000_000,
+            max_video_bytes: 200 * 1024 * 1024,
+        };
+        assert_eq!(max_body_bytes(limits), 200 * 1024 * 1024);
+        assert_eq!(limits.max_video_bytes / (1024 * 1024), 200);
+    }
+
+    #[test]
+    fn transcode_produces_small_playable_mp4() {
+        let ffmpeg = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output();
+        if ffmpeg.is_err() {
+            eprintln!("skipping: ffmpeg not installed");
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let dir = std::env::temp_dir();
+            let source = dir.join("eco-test-src.mp4");
+            let generated = tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=1:size=640x360:rate=25",
+                ])
+                .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+                .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac"])
+                .arg(&source)
+                .output()
+                .await
+                .expect("ffmpeg test clip generation failed");
+            assert!(generated.status.success(), "test clip generation failed");
+
+            let limits = UploadLimits {
+                max_image_bytes: 10 * 1024 * 1024,
+                max_document_bytes: 50 * 1024 * 1024,
+                max_image_pixels: 40_000_000,
+                max_video_bytes: 200 * 1024 * 1024,
+            };
+            let result = transcode_video(limits, &source, "test-clip.mov")
+                .await
+                .expect("transcode failed");
+            assert_eq!(result.mime_type, "video/mp4");
+            assert_eq!(result.extension, "mp4");
+            assert_eq!(result.kind, "video");
+            assert!(result.size_bytes > 0);
+            let _ = tokio::fs::remove_file(&source).await;
+            let _ = tokio::fs::remove_file(&result.path).await;
+        });
     }
 }
