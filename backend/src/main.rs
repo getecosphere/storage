@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use image::{imageops::FilterType, GenericImageView};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr};
 use tokio::io::AsyncWriteExt;
@@ -674,6 +674,20 @@ fn encode_webp(image: &image::DynamicImage, quality: f32) -> Vec<u8> {
     }
 }
 
+fn encode_jpeg(image: &image::DynamicImage, quality: u8) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut buffer, quality);
+    encoder
+        .encode(
+            image.as_bytes(),
+            image.width(),
+            image.height(),
+            image.color().into(),
+        )
+        .expect("JPEG encoding should not fail on decoded image");
+    buffer
+}
+
 fn process_upload(
     limits: UploadLimits,
     bytes: &[u8],
@@ -730,6 +744,17 @@ fn process_upload(
                 bytes: candidate,
                 mime_type: "image/webp".to_string(),
                 extension: "webp",
+                kind: "image",
+                thumbnail: Some(thumbnail),
+            });
+        }
+        let jpeg_bytes = encode_jpeg(&main_image, 85);
+        if jpeg_bytes.len() < bytes.len() {
+            return Ok(ProcessedUpload {
+                size_bytes: jpeg_bytes.len(),
+                bytes: jpeg_bytes,
+                mime_type: "image/jpeg".to_string(),
+                extension: "jpg",
                 kind: "image",
                 thumbnail: Some(thumbnail),
             });
