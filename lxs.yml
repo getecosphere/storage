@@ -1,4 +1,4 @@
-name: photos
+name: storage
 domain: photos
 version: 1.0.0
 publisher: stuff8
@@ -29,6 +29,8 @@ contract:
       - MAX_DOCUMENT_MB
       - MAX_IMAGE_PIXELS
       - MAX_VIDEO_MB
+    defaults:
+      S3_BUCKET: stuff8-storage
   db: "none"
   network:
     inbound: [http]
