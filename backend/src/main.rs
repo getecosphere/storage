@@ -1,4 +1,4 @@
-use photos_backend::bootstrap;
+use storage_backend::bootstrap;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
