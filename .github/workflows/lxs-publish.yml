@@ -1,0 +1,48 @@
+name: publish-lxs
+
+# On a `vX.Y.Z` tag, build this domain as a static Linux LXS and publish it to
+# the getecosphere/lxs-registry under the canonical "Eco Creator" publisher.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install zig + cargo-zigbuild
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz
+          tar xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
+
+      - name: Build the eco CLI
+        run: |
+          git clone --depth 1 https://github.com/kelastanpatembok/ecology-ddd.git /tmp/eco
+          cd /tmp/eco/rust && cargo build --release
+
+      - name: Build + publish the LXS
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GETECOSPHERE_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY##*/}"
+          V="${GITHUB_REF_NAME#v}"
+          git clone "https://x-access-token:${REGISTRY_TOKEN}@github.com/getecosphere/lxs-registry.git" /tmp/reg
+          export ECO_LXS_REGISTRY=/tmp/reg
+          /tmp/eco/rust/target/release/eco lxs build
+          /tmp/eco/rust/target/release/eco lxs publish "${REPO}@${V}"
+          git -C /tmp/reg push origin main --tags
