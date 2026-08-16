@@ -1,0 +1,1 @@
+const RUST_VERSION: &str = "1.97.1";

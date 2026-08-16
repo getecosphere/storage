@@ -8,7 +8,8 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let port: u16 = std::env::var("PORT")
+    let port: u16 = std::env::var("SERVER_PORT")
+        .or_else(|_| std::env::var("PORT"))
         .unwrap_or_else(|_| "8081".to_string())
         .parse()
         .unwrap_or(8081);
