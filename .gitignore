@@ -5,3 +5,5 @@
 !.env.example
 .DS_Store
 .lxs-artifacts.json
+*.env
+!.env.example
