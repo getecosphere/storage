@@ -1,0 +1,144 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "storage",
+    "version": "1.0.5",
+    "description": "Photos/media object store: multipart uploads (image -> WebP/thumbnail, document passthrough, video -> MP4 via ffmpeg), S3/MinIO storage, Range-aware content streaming, thumbnails. No auth. Errors are plain-text (text/plain) strings."
+  },
+  "servers": [
+    { "url": "/api", "description": "All routes are nested under /api (plus a bare /health at root)" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness probe",
+        "responses": { "200": { "description": "OK", "content": { "text/plain": { "schema": { "type": "string", "example": "OK - Storage domain service (S3/MinIO)" } } } } }
+      }
+    },
+    "/photos/health": {
+      "get": {
+        "summary": "Liveness probe (legacy pre-rename path)",
+        "responses": { "200": { "description": "OK", "content": { "text/plain": { "schema": { "type": "string" } } } } }
+      }
+    },
+    "/storage/objects": {
+      "post": {
+        "summary": "Upload an image, document, or video; returns object metadata",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file", "owner_id", "namespace", "reference_id"],
+                "properties": {
+                  "file": { "type": "string", "format": "binary", "description": "image/jpeg|png|webp, documents (pdf/doc/docx/xls/xlsx/txt), or video MIME types. Images -> downscaled WebP + -thumb.webp; documents stored as-is; videos -> ffmpeg MP4." },
+                  "owner_id": { "type": "string", "description": "[A-Za-z0-9._-], max 120" },
+                  "namespace": { "type": "string", "description": "[A-Za-z0-9._-], max 120" },
+                  "reference_id": { "type": "string", "description": "[A-Za-z0-9._-], max 120" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StoredObject" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "408": { "$ref": "#/components/responses/Error" },
+          "413": { "$ref": "#/components/responses/Error" },
+          "415": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List objects under a namespace/reference_id prefix owned by owner_id",
+        "parameters": [
+          { "name": "owner_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "namespace", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "reference_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/StoredObject" } } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/storage/content/{key}": {
+      "get": {
+        "summary": "Retrieve object bytes (Range-aware streaming; 206 Partial Content for single Range headers)",
+        "parameters": [
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Full object key (slashes allowed); each segment [A-Za-z0-9._-]" },
+          { "name": "Range", "in": "header", "required": false, "schema": { "type": "string", "example": "bytes=0-1023" } }
+        ],
+        "responses": {
+          "200": { "description": "Full object (Accept-Ranges: bytes)", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+          "206": { "description": "Partial Content (Content-Range: bytes start-end/total)", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "head": {
+        "summary": "Probe object headers without the body (same headers as GET)",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Headers only" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/storage/objects/{key}": {
+      "get": {
+        "summary": "Object metadata",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StoredObject" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete an object (and its -thumb.webp sibling for images); owner_id must match",
+        "parameters": [
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "owner_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "204": { "description": "No Content" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "Error": {
+        "description": "Plain-text error message (text/plain)",
+        "content": { "text/plain": { "schema": { "type": "string" } } }
+      }
+    },
+    "schemas": {
+      "StoredObject": {
+        "type": "object",
+        "required": ["key", "original_name", "mime_type", "size_bytes", "kind", "owner_id", "namespace", "reference_id", "created_at"],
+        "properties": {
+          "key": { "type": "string", "example": "inventory/item-42/6f1e9f2b-a1c4-4b8d-9e0f-1a2b3c4d5e6f.webp" },
+          "original_name": { "type": "string" },
+          "mime_type": { "type": "string", "example": "image/webp" },
+          "size_bytes": { "type": "integer", "format": "int64" },
+          "kind": { "type": "string", "enum": ["image", "document", "video"] },
+          "owner_id": { "type": "string" },
+          "namespace": { "type": "string" },
+          "reference_id": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "thumbnail_key": { "type": "string", "nullable": true, "description": "Present only for kind=image (the -thumb.webp sibling)" }
+        }
+      }
+    }
+  }
+}

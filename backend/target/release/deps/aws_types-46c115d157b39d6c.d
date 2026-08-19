@@ -1,0 +1,19 @@
+/Users/eco/ar-rahman/lxs/storage/backend/target/release/deps/aws_types-46c115d157b39d6c.d: /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/lib.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/app_name.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/build_metadata.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/endpoint_config.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/origin.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/os_shim_internal.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/region.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/request_id.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/sdk_config.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/sdk_ua_metadata.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/service_config.rs /Users/eco/ar-rahman/lxs/storage/backend/target/release/build/aws-types-8f3e174e73010c71/out/build_env.rs
+
+/Users/eco/ar-rahman/lxs/storage/backend/target/release/deps/libaws_types-46c115d157b39d6c.rmeta: /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/lib.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/app_name.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/build_metadata.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/endpoint_config.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/origin.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/os_shim_internal.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/region.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/request_id.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/sdk_config.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/sdk_ua_metadata.rs /Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/service_config.rs /Users/eco/ar-rahman/lxs/storage/backend/target/release/build/aws-types-8f3e174e73010c71/out/build_env.rs
+
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/lib.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/app_name.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/build_metadata.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/endpoint_config.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/origin.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/os_shim_internal.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/region.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/request_id.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/sdk_config.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/sdk_ua_metadata.rs:
+/Users/eco/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-types-1.5.0/src/service_config.rs:
+/Users/eco/ar-rahman/lxs/storage/backend/target/release/build/aws-types-8f3e174e73010c71/out/build_env.rs:
+
+# env-dep:CARGO_PKG_VERSION=1.5.0
+# env-dep:OUT_DIR=/Users/eco/ar-rahman/lxs/storage/backend/target/release/build/aws-types-8f3e174e73010c71/out
